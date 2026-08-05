@@ -87,11 +87,17 @@ jobs:
           cid="$(docker create --platform "${PLATFORM}" "${DS_IMAGE}:${DS_TAG}")"
           echo "container: ${cid}"
           mkdir -p out/bin out/sdkjs
-          # bin:  x2t + docbuilder + companion shared libs (.so) — the converter engine.
-          #       Path confirmed by config/supervisor/ds/ds-converter.conf (LD_LIBRARY_PATH).
-          docker cp "${cid}:/var/www/onlyoffice/documentserver/server/FileConverter/bin/." out/bin
-          # sdkjs: JS Api scripts required by docbuilder at runtime (x2t does not need them).
-          docker cp "${cid}:/var/www/onlyoffice/documentserver/sdkjs/." out/sdkjs
+          # Stream as tar and extract WITHOUT preserving source ownership/modes.
+          # The image ships template files (bin/empty/*.docx) with restrictive
+          # perms that make a plain `docker cp` into the runner workspace fail
+          # with "permission denied". --no-same-owner extracts as the runner
+          # user; --no-same-permissions applies the umask. bin = x2t + docbuilder
+          # + companion shared libs (.so); sdkjs = JS Api scripts (docbuilder only).
+          # Path confirmed by config/supervisor/ds/ds-converter.conf (LD_LIBRARY_PATH).
+          docker cp "${cid}:/var/www/onlyoffice/documentserver/server/FileConverter/bin/." - \
+            | tar -x --no-same-owner --no-same-permissions -C out/bin
+          docker cp "${cid}:/var/www/onlyoffice/documentserver/sdkjs/." - \
+            | tar -x --no-same-owner --no-same-permissions -C out/sdkjs
           docker rm "${cid}" >/dev/null
           # sanity check the two binaries we depend on are present
           test -f out/bin/x2t
