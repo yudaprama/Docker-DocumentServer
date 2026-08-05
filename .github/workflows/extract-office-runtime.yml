@@ -1,0 +1,260 @@
+### Extract the ONLYOFFICE headless runtime (x2t + docbuilder + dylibs + sdkjs)
+### from the official DocumentServer image (linux) and Desktop Editors DMG (darwin),
+### and publish per-platform tarballs as a GitHub release for downstream download
+### (consumed by planoctl's download-first resolver for egent-office).
+###
+### Trigger model mirrors metering/.github/workflows/release.yml: rebuild + republish
+### on every push to the default branch. Source versions are pinned in env: below —
+### bump PINNED_DS_TAG / PINNED_DMG_VERSION and push to roll to a new ONLYOFFICE
+### release. workflow_dispatch lets you override for one-off extractions.
+###
+### Artifacts (each self-contained: bin/ + sdkjs/):
+###   office-runtime-linux-amd64.tar.gz   <- onlyoffice/documentserver image
+###   office-runtime-linux-arm64.tar.gz   <- onlyoffice/documentserver image
+###   office-runtime-darwin-arm64.tar.gz  <- ONLYOFFICE-arm.dmg
+###   office-runtime-darwin-amd64.tar.gz  <- ONLYOFFICE-x86_64.dmg
+###
+### Note: `docker cp` / `cp` from a *created* (not started) container/DMG never
+### executes the foreign-arch binary, so arm64 extraction on an amd64 runner
+### works without emulation.
+name: Extract ONLYOFFICE runtime
+run-name: "extract runtime-v${{ github.run_number }} (ds=${{ inputs.ds_tag || env.PINNED_DS_TAG }}, desktop=v${{ inputs.dmg_version || env.PINNED_DMG_VERSION }})"
+
+on:
+  push:
+    branches: [master]
+  workflow_dispatch:
+    inputs:
+      ds_tag:
+        description: "onlyoffice/documentserver image tag, no leading v (e.g. 9.4.0). Empty = use PINNED_DS_TAG."
+        type: string
+        required: false
+        default: ""
+      dmg_version:
+        description: "ONLYOFFICE Desktop Editors version, no leading v (e.g. 9.4.0). Empty = use PINNED_DMG_VERSION."
+        type: string
+        required: false
+        default: ""
+      release_tag:
+        description: "Release tag (e.g. runtime-v9.4.0). Empty = runtime-v<run_number> (auto-increment)."
+        type: string
+        required: false
+        default: ""
+
+permissions:
+  contents: write
+
+env:
+  DS_IMAGE: onlyoffice/documentserver
+  # Pinned source versions used on branch pushes. Bump + push to roll forward.
+  PINNED_DS_TAG: "9.4.0"
+  PINNED_DMG_VERSION: "9.4.0"
+
+jobs:
+  # --------------------------------------------------------------------------- #
+  # linux/amd64 + linux/arm64: pull the official image, copy out bin + sdkjs.
+  # --------------------------------------------------------------------------- #
+  extract-linux:
+    name: "linux/${{ matrix.arch }}"
+    runs-on: ubuntu-latest
+    outputs:
+      ds_tag: ${{ steps.tag.outputs.ds_tag }}
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: [amd64, arm64]
+    steps:
+      - name: Resolve DocumentServer tag
+        id: tag
+        shell: bash
+        run: |
+          set -euo pipefail
+          v="${{ inputs.ds_tag }}"
+          [ -z "${v}" ] && v="${PINNED_DS_TAG}"
+          echo "ds_tag=${v}" >> "$GITHUB_OUTPUT"
+
+      - name: Set up QEMU (multi-arch image pull)
+        uses: docker/setup-qemu-action@v4
+
+      - name: Pull image and extract converter + sdkjs
+        shell: bash
+        env:
+          PLATFORM: linux/${{ matrix.arch }}
+          DS_TAG: ${{ steps.tag.outputs.ds_tag }}
+        run: |
+          set -euo pipefail
+          docker pull --platform "${PLATFORM}" "${DS_IMAGE}:${DS_TAG}"
+          cid="$(docker create --platform "${PLATFORM}" "${DS_IMAGE}:${DS_TAG}")"
+          echo "container: ${cid}"
+          mkdir -p out/bin out/sdkjs
+          # bin:  x2t + docbuilder + companion shared libs (.so) — the converter engine.
+          #       Path confirmed by config/supervisor/ds/ds-converter.conf (LD_LIBRARY_PATH).
+          docker cp "${cid}:/var/www/onlyoffice/documentserver/server/FileConverter/bin/." out/bin
+          # sdkjs: JS Api scripts required by docbuilder at runtime (x2t does not need them).
+          docker cp "${cid}:/var/www/onlyoffice/documentserver/sdkjs/." out/sdkjs
+          docker rm "${cid}" >/dev/null
+          # sanity check the two binaries we depend on are present
+          test -f out/bin/x2t
+          test -f out/bin/docbuilder
+          echo "::notice::extracted $(ls out/bin | wc -l) bin entries, $(find out/sdkjs -type f | wc -l) sdkjs files"
+          tar -C out -czf "office-runtime-linux-${{ matrix.arch }}.tar.gz" bin sdkjs
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: office-runtime-linux-${{ matrix.arch }}
+          path: office-runtime-linux-${{ matrix.arch }}.tar.gz
+          retention-days: 14
+          if-no-files-found: error
+
+  # --------------------------------------------------------------------------- #
+  # darwin/arm64 + darwin/amd64: mount the Desktop Editors DMG, copy converter
+  # (x2t/docbuilder/dylibs) + sdkjs out of the .app bundle. Runs on a macOS
+  # runner; copying files from the mounted DMG never executes them, so both
+  # architectures can be extracted on the macos-14 (arm64) runner.
+  # --------------------------------------------------------------------------- #
+  extract-darwin:
+    name: "darwin/${{ matrix.arch }}"
+    runs-on: macos-14
+    outputs:
+      dmg_version: ${{ steps.tag.outputs.dmg_version }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: arm64
+            dmg: ONLYOFFICE-arm.dmg
+          - arch: amd64
+            dmg: ONLYOFFICE-x86_64.dmg
+    steps:
+      - name: Resolve Desktop Editors version
+        id: tag
+        shell: bash
+        run: |
+          set -euo pipefail
+          v="${{ inputs.dmg_version }}"
+          [ -z "${v}" ] && v="${PINNED_DMG_VERSION}"
+          echo "dmg_version=${v}" >> "$GITHUB_OUTPUT"
+
+      - name: Download + mount Desktop Editors DMG
+        shell: bash
+        env:
+          DMG: ${{ matrix.dmg }}
+          VERSION: ${{ steps.tag.outputs.dmg_version }}
+        run: |
+          set -euo pipefail
+          url="https://github.com/ONLYOFFICE/DesktopEditors/releases/download/v${VERSION}/${DMG}"
+          echo "Downloading ${url}"
+          curl -fL --retry 3 -o ONLYOFFICE.dmg "${url}"
+          hdiutil attach ONLYOFFICE.dmg -nobrowse -mountpoint /Volumes/ONLYOFFICE
+          ls /Volumes/ONLYOFFICE
+
+      - name: Extract converter + sdkjs from app bundle
+        shell: bash
+        run: |
+          set -euo pipefail
+          APP="/Volumes/ONLYOFFICE/ONLYOFFICE.app"
+          [ -d "${APP}" ] || { echo "ONLYOFFICE.app not found at ${APP}" >&2; exit 1; }
+
+          mkdir -p out/bin out/sdkjs
+
+          # converter dir holds x2t, docbuilder, *.dylib
+          x2t="$(find "${APP}" -type f -name x2t -print -quit)"
+          [ -n "${x2t}" ] || { echo "x2t not found in bundle" >&2; exit 1; }
+          CONVERTER="$(dirname "${x2t}")"
+          echo "converter dir: ${CONVERTER}"
+          cp -R "${CONVERTER}/." out/bin
+
+          # sdkjs scripts (docbuilder needs them at runtime). The desktop bundle
+          # ships the same sdkjs as the server; if absent here, fall back is a
+          # clear failure caught at egent-office run time.
+          SDKJS="$(find "${APP}" -type d -name sdkjs -print -quit)"
+          if [ -n "${SDKJS}" ]; then
+            echo "sdkjs dir: ${SDKJS}"
+            cp -R "${SDKJS}/." out/sdkjs
+          else
+            echo "::warning::sdkjs dir not found in bundle; tarball will carry binaries only"
+          fi
+
+          ls -la out/bin/x2t out/bin/docbuilder 2>/dev/null || true
+          echo "extracted $(ls out/bin | wc -l) bin entries, $(find out/sdkjs -type f 2>/dev/null | wc -l) sdkjs files"
+
+          # strip quarantine / extended attrs so extracted binaries run on the dev host
+          xattr -cr out || true
+          tar -C out -czf "office-runtime-darwin-${{ matrix.arch }}.tar.gz" bin sdkjs
+
+      - name: Detach DMG
+        if: always()
+        shell: bash
+        run: |
+          hdiutil detach /Volumes/ONLYOFFICE -force >/dev/null 2>&1 || true
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: office-runtime-darwin-${{ matrix.arch }}
+          path: office-runtime-darwin-${{ matrix.arch }}.tar.gz
+          retention-days: 14
+          if-no-files-found: error
+
+  # --------------------------------------------------------------------------- #
+  # Publish all four tarballs to a versioned GitHub release. softprops handles
+  # create-or-update so re-runs with the same tag are idempotent.
+  # --------------------------------------------------------------------------- #
+  release:
+    name: "Publish runtime release"
+    runs-on: ubuntu-latest
+    needs: [extract-linux, extract-darwin]
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Resolve release tag
+        id: rel
+        shell: bash
+        run: |
+          set -euo pipefail
+          t="${{ inputs.release_tag }}"
+          if [ -z "${t}" ]; then t="runtime-v${{ github.run_number }}"; fi
+          echo "tag=${t}" >> "$GITHUB_OUTPUT"
+
+      - name: Download all platform artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: List artifacts
+        shell: bash
+        run: |
+          set -euo pipefail
+          ls -la artifacts/
+          echo "---"
+          ls -la artifacts/*.tar.gz
+
+      - name: Publish GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.rel.outputs.tag }}
+          name: ${{ steps.rel.outputs.tag }}
+          generate_release_notes: true
+          body: |
+            Headless ONLYOFFICE runtime for `egent-office` (x2t + docbuilder + dylibs + sdkjs).
+
+            Source: DocumentServer `${{ needs.extract-linux.outputs.ds_tag }}` (linux),
+            Desktop Editors `v${{ needs.extract-darwin.outputs.dmg_version }}` (darwin).
+
+            | Artifact | GOOS / GOARCH | Source |
+            | --- | --- | --- |
+            | `office-runtime-linux-amd64.tar.gz` | linux/amd64 | documentserver image |
+            | `office-runtime-linux-arm64.tar.gz` | linux/arm64 | documentserver image |
+            | `office-runtime-darwin-arm64.tar.gz` | darwin/arm64 | `ONLYOFFICE-arm.dmg` |
+            | `office-runtime-darwin-amd64.tar.gz` | darwin/amd64 | `ONLYOFFICE-x86_64.dmg` |
+
+            Each tarball expands to `bin/` (x2t, docbuilder, shared libs) + `sdkjs/` (JS Api scripts).
+          files: |
+            artifacts/office-runtime-linux-amd64.tar.gz
+            artifacts/office-runtime-linux-arm64.tar.gz
+            artifacts/office-runtime-darwin-arm64.tar.gz
+            artifacts/office-runtime-darwin-amd64.tar.gz
