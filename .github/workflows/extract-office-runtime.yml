@@ -18,7 +18,7 @@
 ### executes the foreign-arch binary, so arm64 extraction on an amd64 runner
 ### works without emulation.
 name: Extract ONLYOFFICE runtime
-run-name: "extract runtime-v${{ github.run_number }} (ds=${{ inputs.ds_tag || env.PINNED_DS_TAG }}, desktop=v${{ inputs.dmg_version || env.PINNED_DMG_VERSION }})"
+run-name: "extract runtime-v${{ github.run_number }}${{ github.event_name == 'workflow_dispatch' && format(' (ds={0}, desktop=v{1})', inputs.ds_tag, inputs.dmg_version) || '' }}"
 
 on:
   push:
