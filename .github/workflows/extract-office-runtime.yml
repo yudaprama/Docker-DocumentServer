@@ -30,8 +30,10 @@
 ###
 ### License note: the free Document Builder permits builder.CreateFile (new
 ### documents) but gates builder.OpenFile (editing existing documents) behind a
-### commercial license. So create_document/convert_document/extract_text work on
-### every platform; edit_document requires a licensed docbuilder everywhere.
+### commercial license. egent-office works around this: create_document uses
+### docbuilder (CreateFile), while edit_document uses pure-Go gooxml (no
+### docbuilder, no license). So all four egent-office tools work on every
+### platform regardless of the Document Builder license.
 name: Extract ONLYOFFICE runtime
 run-name: "extract runtime-v${{ github.run_number }}${{ github.event_name == 'workflow_dispatch' && format(' (ds={0}, desktop=v{1})', inputs.ds_tag, inputs.dmg_version) || '' }}"
 
