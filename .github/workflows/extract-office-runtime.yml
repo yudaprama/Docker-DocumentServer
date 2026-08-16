@@ -11,6 +11,14 @@
 ###                     ships x2t but NOT docbuilder, so the Document Builder
 ###                     archive is the darwin docbuilder source)
 ###   darwin  sdkjs/ <- Desktop Editors DMG
+###   windows bin/   <- ONLYOFFICE/DocumentBuilder release archive
+###                    (onlyoffice-documentbuilder-windows-x64.zip: docbuilder.exe
+###                     + x2t.exe + DLLs). NOTE: upstream publishes windows x64/x86
+###                    only — there is NO windows-arm64 build, so no arm64 tarball.
+###   windows sdkjs/ <- onlyoffice/documentserver image (sdkjs is pure,
+###                    platform-independent JS — the desktop bundle ships the same
+###                    sdkjs as the server; extracting from the image avoids
+###                    unpacking the Desktop Editors .exe installer)
 ###
 ### Trigger model mirrors metering/.github/workflows/release.yml: rebuild + republish
 ### on every push to the default branch. Source versions are pinned in env: below —
@@ -23,6 +31,7 @@
 ###   office-runtime-linux-arm64.tar.gz   <- documentserver image
 ###   office-runtime-darwin-arm64.tar.gz  <- DocumentBuilder archive + DMG sdkjs
 ###   office-runtime-darwin-amd64.tar.gz  <- DocumentBuilder archive + DMG sdkjs
+###   office-runtime-windows-amd64.tar.gz <- DocumentBuilder win-x64 zip + image sdkjs
 ###
 ### Note: `docker cp` / `cp` from a *created* (not started) container/DMG never
 ### executes the foreign-arch binary, so arm64 extraction on an amd64 runner
@@ -238,13 +247,89 @@ jobs:
           if-no-files-found: error
 
   # --------------------------------------------------------------------------- #
-  # Publish all four tarballs to a versioned GitHub release. softprops handles
+  # windows/amd64: Document Builder Windows archive (docbuilder.exe + x2t.exe +
+  # DLLs) + sdkjs from the documentserver image. Runs on ubuntu-latest — we only
+  # ever COPY the PE binaries, never execute them, so no windows runner is
+  # needed. Upstream publishes windows x64/x86 only; no arm64 exists.
+  # --------------------------------------------------------------------------- #
+  extract-windows:
+    name: "windows/amd64"
+    runs-on: ubuntu-latest
+    outputs:
+      db_version: ${{ steps.tag.outputs.db_version }}
+    steps:
+      - name: Resolve versions
+        id: tag
+        shell: bash
+        run: |
+          set -euo pipefail
+          v="${{ inputs.dmg_version }}"
+          [ -z "${v}" ] && v="${PINNED_DMG_VERSION}"
+          # Document Builder releases track the same version across platforms
+          # (9.4.0, ...) — same resolution as the darwin job.
+          echo "db_version=${v}" >> "$GITHUB_OUTPUT"
+          ds="${{ inputs.ds_tag }}"
+          [ -z "${ds}" ] && ds="${PINNED_DS_TAG}"
+          echo "ds_tag=${ds}" >> "$GITHUB_OUTPUT"
+
+      - name: Download Document Builder Windows archive (docbuilder + x2t + DLLs)
+        shell: bash
+        env:
+          DB_VERSION: ${{ steps.tag.outputs.db_version }}
+        run: |
+          set -euo pipefail
+          # Same source family as the darwin job, Windows flavor: a complete,
+          # self-consistent headless runtime (docbuilder.exe + x2t.exe + DLLs +
+          # DoctRenderer.config). zip, not tar.xz, on Windows.
+          asset="onlyoffice-documentbuilder-windows-x64.zip"
+          url="https://github.com/ONLYOFFICE/DocumentBuilder/releases/download/v${DB_VERSION}/${asset}"
+          echo "Downloading ${url}"
+          curl -fL --retry 3 -o db.zip "${url}"
+          mkdir -p out/bin
+          unzip -q db.zip -d out/bin
+          # Some archives wrap content in a top-level dir; flatten if so.
+          if [ ! -f out/bin/docbuilder.exe ] && [ "$(ls out/bin | wc -l)" -eq 1 ]; then
+            inner="$(ls out/bin | head -1)"
+            mv "out/bin/${inner}/." out/bin/ && rmdir "out/bin/${inner}"
+          fi
+          test -f out/bin/docbuilder.exe || { echo "docbuilder.exe missing from archive" >&2; exit 1; }
+          test -f out/bin/x2t.exe || { echo "x2t.exe missing from archive" >&2; exit 1; }
+          echo "::notice::Document Builder bin: $(ls out/bin | wc -l) entries (docbuilder.exe + x2t.exe + DLLs)"
+
+      - name: Extract sdkjs from documentserver image
+        shell: bash
+        env:
+          DS_TAG: ${{ steps.tag.outputs.ds_tag }}
+        run: |
+          set -euo pipefail
+          # sdkjs is platform-independent JS (the desktop bundle ships the same
+          # sdkjs as the server) — take it from the version-matched image instead
+          # of unpacking the Desktop Editors Windows .exe installer.
+          docker pull --platform linux/amd64 "${DS_IMAGE}:${DS_TAG}"
+          cid="$(docker create --platform linux/amd64 "${DS_IMAGE}:${DS_TAG}")"
+          mkdir -p out/sdkjs
+          docker cp "${cid}:/var/www/onlyoffice/documentserver/sdkjs/." - \
+            | tar -x --no-same-owner --no-same-permissions -C out/sdkjs
+          docker rm "${cid}" >/dev/null
+          echo "extracted $(ls out/bin | wc -l) bin entries, $(find out/sdkjs -type f | wc -l) sdkjs files"
+          tar -C out -czf "office-runtime-windows-amd64.tar.gz" bin sdkjs
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: office-runtime-windows-amd64
+          path: office-runtime-windows-amd64.tar.gz
+          retention-days: 14
+          if-no-files-found: error
+
+  # --------------------------------------------------------------------------- #
+  # Publish all platform tarballs to a versioned GitHub release. softprops handles
   # create-or-update so re-runs with the same tag are idempotent.
   # --------------------------------------------------------------------------- #
   release:
     name: "Publish runtime release"
     runs-on: ubuntu-latest
-    needs: [extract-linux, extract-darwin]
+    needs: [extract-linux, extract-darwin, extract-windows]
     steps:
       - uses: actions/checkout@v7
         with:
@@ -283,7 +368,8 @@ jobs:
             Headless ONLYOFFICE runtime for `egent-office` (x2t + docbuilder + dylibs + sdkjs).
 
             Source: DocumentServer `${{ needs.extract-linux.outputs.ds_tag }}` (linux),
-            Desktop Editors `v${{ needs.extract-darwin.outputs.dmg_version }}` (darwin).
+            Desktop Editors `v${{ needs.extract-darwin.outputs.dmg_version }}` (darwin),
+            Document Builder `v${{ needs.extract-windows.outputs.db_version }}` (windows).
 
             | Artifact | GOOS / GOARCH | Source |
             | --- | --- | --- |
@@ -291,10 +377,13 @@ jobs:
             | `office-runtime-linux-arm64.tar.gz` | linux/arm64 | documentserver image |
             | `office-runtime-darwin-arm64.tar.gz` | darwin/arm64 | `ONLYOFFICE-arm.dmg` |
             | `office-runtime-darwin-amd64.tar.gz` | darwin/amd64 | `ONLYOFFICE-x86_64.dmg` |
+            | `office-runtime-windows-amd64.tar.gz` | windows/amd64 | DocumentBuilder win-x64 zip + image sdkjs |
 
             Each tarball expands to `bin/` (x2t, docbuilder, shared libs) + `sdkjs/` (JS Api scripts).
+            Windows arm64 is absent — upstream ships no such build.
           files: |
             artifacts/office-runtime-linux-amd64.tar.gz
             artifacts/office-runtime-linux-arm64.tar.gz
             artifacts/office-runtime-darwin-arm64.tar.gz
             artifacts/office-runtime-darwin-amd64.tar.gz
+            artifacts/office-runtime-windows-amd64.tar.gz
