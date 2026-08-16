@@ -13,8 +13,9 @@
 ###   darwin  sdkjs/ <- Desktop Editors DMG
 ###   windows bin/   <- ONLYOFFICE/DocumentBuilder release archive
 ###                    (onlyoffice-documentbuilder-windows-x64.zip: docbuilder.exe
-###                     + x2t.exe + DLLs). NOTE: upstream publishes windows x64/x86
-###                    only — there is NO windows-arm64 build, so no arm64 tarball.
+###                     + x2t.exe + DLLs). Upstream publishes x64 only; arm64
+###                    artifact repackages the x64 binaries (runs via Windows
+###                    Prism x64 emulation on ARM64 hosts).
 ###   windows sdkjs/ <- onlyoffice/documentserver image (sdkjs is pure,
 ###                    platform-independent JS — the desktop bundle ships the same
 ###                    sdkjs as the server; extracting from the image avoids
@@ -32,6 +33,8 @@
 ###   office-runtime-darwin-arm64.tar.gz  <- DocumentBuilder archive + DMG sdkjs
 ###   office-runtime-darwin-amd64.tar.gz  <- DocumentBuilder archive + DMG sdkjs
 ###   office-runtime-windows-amd64.tar.gz <- DocumentBuilder win-x64 zip + image sdkjs
+###   office-runtime-windows-arm64.tar.gz <- DocumentBuilder win-x64 zip + image sdkjs
+###                                          (x64 binaries; runs via Prism emulation)
 ###
 ### Note: `docker cp` / `cp` from a *created* (not started) container/DMG never
 ### executes the foreign-arch binary, so arm64 extraction on an amd64 runner
@@ -247,16 +250,21 @@ jobs:
           if-no-files-found: error
 
   # --------------------------------------------------------------------------- #
-  # windows/amd64: Document Builder Windows archive (docbuilder.exe + x2t.exe +
-  # DLLs) + sdkjs from the documentserver image. Runs on ubuntu-latest — we only
-  # ever COPY the PE binaries, never execute them, so no windows runner is
-  # needed. Upstream publishes windows x64/x86 only; no arm64 exists.
+  # windows/amd64 + windows/arm64: Document Builder Windows archive (docbuilder.exe
+  # + x2t.exe + DLLs) + sdkjs from the documentserver image. Runs on ubuntu-latest
+  # — we only ever COPY the PE binaries, never execute them, so no windows runner
+  # is needed. Upstream publishes x64 only; arm64 artifact repackages the x64
+  # binaries (runs via Windows Prism x64 emulation on ARM64 hosts).
   # --------------------------------------------------------------------------- #
   extract-windows:
-    name: "windows/amd64"
+    name: "windows/${{ matrix.arch }}"
     runs-on: ubuntu-latest
     outputs:
       db_version: ${{ steps.tag.outputs.db_version }}
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: [amd64, arm64]
     steps:
       - name: Resolve versions
         id: tag
@@ -280,7 +288,9 @@ jobs:
           set -euo pipefail
           # Same source family as the darwin job, Windows flavor: a complete,
           # self-consistent headless runtime (docbuilder.exe + x2t.exe + DLLs +
-          # DoctRenderer.config). zip, not tar.xz, on Windows.
+          # DoctRenderer.config). zip, not tar.xz, on Windows. Upstream publishes
+          # x64 only — arm64 artifact repackages the same x64 binaries (runs via
+          # Windows Prism x64 emulation on ARM64 hosts).
           asset="onlyoffice-documentbuilder-windows-x64.zip"
           url="https://github.com/ONLYOFFICE/DocumentBuilder/releases/download/v${DB_VERSION}/${asset}"
           echo "Downloading ${url}"
@@ -312,13 +322,13 @@ jobs:
             | tar -x --no-same-owner --no-same-permissions -C out/sdkjs
           docker rm "${cid}" >/dev/null
           echo "extracted $(ls out/bin | wc -l) bin entries, $(find out/sdkjs -type f | wc -l) sdkjs files"
-          tar -C out -czf "office-runtime-windows-amd64.tar.gz" bin sdkjs
+          tar -C out -czf "office-runtime-windows-${{ matrix.arch }}.tar.gz" bin sdkjs
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: office-runtime-windows-amd64
-          path: office-runtime-windows-amd64.tar.gz
+          name: office-runtime-windows-${{ matrix.arch }}
+          path: office-runtime-windows-${{ matrix.arch }}.tar.gz
           retention-days: 14
           if-no-files-found: error
 
@@ -378,12 +388,14 @@ jobs:
             | `office-runtime-darwin-arm64.tar.gz` | darwin/arm64 | `ONLYOFFICE-arm.dmg` |
             | `office-runtime-darwin-amd64.tar.gz` | darwin/amd64 | `ONLYOFFICE-x86_64.dmg` |
             | `office-runtime-windows-amd64.tar.gz` | windows/amd64 | DocumentBuilder win-x64 zip + image sdkjs |
+            | `office-runtime-windows-arm64.tar.gz` | windows/arm64 | DocumentBuilder win-x64 zip (Prism emulation) + image sdkjs |
 
             Each tarball expands to `bin/` (x2t, docbuilder, shared libs) + `sdkjs/` (JS Api scripts).
-            Windows arm64 is absent — upstream ships no such build.
+            Windows arm64 uses x64 binaries — runs via Windows Prism x64 emulation on ARM64 hosts.
           files: |
             artifacts/office-runtime-linux-amd64.tar.gz
             artifacts/office-runtime-linux-arm64.tar.gz
             artifacts/office-runtime-darwin-arm64.tar.gz
             artifacts/office-runtime-darwin-amd64.tar.gz
             artifacts/office-runtime-windows-amd64.tar.gz
+            artifacts/office-runtime-windows-arm64.tar.gz
